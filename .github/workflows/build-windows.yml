@@ -54,13 +54,13 @@ jobs:
         python -m pip install poetry poetry-pyinstaller-plugin
         poetry config installer.parallel false
 
-    - name: Cache frontend build
-      uses: actions/cache@v4
-      with:
-        path: ./dweam_web/dist
-        key: ${{ runner.os }}-pnpm-build-${{ hashFiles('dweam_web/src/**') }}
-        restore-keys: |
-          ${{ runner.os }}-pnpm-build-
+    # - name: Cache frontend build
+    #   uses: actions/cache@v4
+    #   with:
+    #     path: ./dweam_web/dist
+    #     key: ${{ runner.os }}-pnpm-build-${{ hashFiles('dweam_web/src/**') }}
+    #     restore-keys: |
+    #       ${{ runner.os }}-pnpm-build-
 
     - name: Build frontend
       shell: cmd
