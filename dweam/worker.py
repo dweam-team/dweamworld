@@ -114,8 +114,8 @@ class GameWorker:
 
         return stdout_str, stderr_str
 
-    async def start(self):
-        """Start the worker process and establish communication"""
+    async def _establish_connection(self, timeout: float) -> bool:
+        """Establish connection with the worker process"""
         if sys.platform == "win32":
             venv_python = self.venv_path / "Scripts" / "python.exe"
         else:
@@ -123,49 +123,43 @@ class GameWorker:
 
         # Use importlib.resources to reliably locate the module file
         if getattr(sys, 'frozen', False):
-            # In PyInstaller bundle
             worker_script = Path(sys._MEIPASS) / "dweam" / "dweam" / "game_process.py"
         else:
-            # In development
             worker_script = files('dweam').joinpath('game_process.py')
+
+        # Create a TCP server socket
+        client_connected = asyncio.Event()
+
+        async def handle_client(reader, writer):
+            self.reader = reader
+            self.writer = writer
+            client_connected.set()
         
-        max_retries = 3
-        retry_delay = 1.0
+        # Create server and get the port
+        server = await asyncio.start_server(
+            handle_client,
+            host='127.0.0.1',
+            port=0
+        )
+        port = server.sockets[0].getsockname()[1]
 
-        for attempt in range(max_retries):
+        self.log.info("Got available port", port=port)
+        
+        # Start the worker process with the port number
+        self.log.info(
+            "Starting worker process", 
+            python=str(venv_python),
+            script=str(worker_script),
+            game_type=self.game_type,
+            game_id=self.game_id
+        )
+
+        # Start serving (but don't block)
+        async with server:
+            self.log.debug("Starting server")
+            server_task = asyncio.create_task(server.serve_forever())
+            
             try:
-                if attempt > 0:
-                    self.log.info(f"Retry attempt {attempt + 1}/{max_retries}")
-                    await asyncio.sleep(retry_delay)
-                
-                # Create a TCP server socket
-                client_connected = asyncio.Event()
-                
-                async def handle_client(reader, writer):
-                    self.reader = reader
-                    self.writer = writer
-                    client_connected.set()
-                    
-                server = await asyncio.start_server(
-                    handle_client,
-                    host='127.0.0.1',
-                    port=0  # Let OS choose port
-                )
-                addr = server.sockets[0].getsockname()
-                port = addr[1]
-
-                # TODO bind a uuid to the logger
-
-                self.log.info("Started TCP server", port=port)
-                
-                # Log what we're about to execute
-                self.log.info("Starting worker process", 
-                             python=str(venv_python),
-                             script=str(worker_script),
-                             game_type=self.game_type,
-                             game_id=self.game_id)
-                
-                # Start the worker process with the port number
                 self.process = await asyncio.create_subprocess_exec(
                     str(venv_python),
                     str(worker_script),
@@ -194,78 +188,77 @@ class GameWorker:
                         stdout=stdout,
                         stderr=stderr
                     )
-                    continue  # Retry
+                    return False
                 except asyncio.TimeoutError:
                     # Process is still running, this is good
                     pass
+                # Wait for either client connection or process termination
+                done, pending = await asyncio.wait([
+                    asyncio.create_task(client_connected.wait()),
+                    asyncio.create_task(self.process.wait())
+                ], timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
 
-                # Try to connect with timeout
+                # If process completed first, it means it crashed
+                if self.process.returncode is not None:
+                    stdout_str, stderr_str = await self._collect_process_output(self.process)
+                    self.log.error(
+                        "Process terminated before connection",
+                        returncode=self.process.returncode,
+                        stderr=stderr_str,
+                        stdout=stdout_str
+                    )
+                    return False  # Changed from raise to return False to allow retries
+
+                # If we get here and nothing completed, it was a timeout
+                if not done:
+                    raise asyncio.TimeoutError("Worker process failed to connect")
+
+            finally:
+                # Cancel server task
+                server_task.cancel()
                 try:
-                    # Start serving (but don't block)
-                    async with server:
-                        self.log.debug("Starting server")
-                        server_task = asyncio.create_task(server.serve_forever())
-                        
-                        try:
-                            # Wait for either client connection or process termination
-                            done, pending = await asyncio.wait([
-                                asyncio.create_task(client_connected.wait()),
-                                asyncio.create_task(self.process.wait())
-                            ], timeout=5, return_when=asyncio.FIRST_COMPLETED)
+                    await server_task
+                except asyncio.CancelledError:
+                    pass
 
-                            # If process completed first, it means it crashed
-                            if self.process.returncode is not None:
-                                stdout_str, stderr_str = await self._collect_process_output(self.process)
-                                self.log.error(
-                                    "Process terminated before connection",
-                                    returncode=self.process.returncode,
-                                    stderr=stderr_str,
-                                    stdout=stdout_str
-                                )
-                                raise RuntimeError(f"Process terminated with return code {self.process.returncode}")
+            if not self.reader or not self.writer:
+                raise RuntimeError("No connection received")
 
-                            # If we get here and nothing completed, it was a timeout
-                            if not done:
-                                raise asyncio.TimeoutError("Worker process failed to connect")
-                        except asyncio.TimeoutError:
-                            # If timeout occurs, collect stderr/stdout before raising
-                            stdout_str, stderr_str = await self._collect_process_output(self.process)
-                                
-                            self.log.error(
-                                "Worker failed to connect",
-                                returncode=self.process.returncode,
-                                stdout=stdout_str,
-                                stderr=stderr_str,
-                            )
-                            raise TimeoutError("Worker process failed to connect")
-                        finally:
-                            # Cancel server task
-                            server_task.cancel()
-                            try:
-                                await server_task
-                            except asyncio.CancelledError:
-                                pass
+        return True
 
-                        if not self.reader or not self.writer:
-                            raise RuntimeError("No connection received")
-                        
-                        # Only start monitoring after successful connection
-                        asyncio.create_task(self._monitor_process_output(self.process.stdout, "stdout"))
-                        asyncio.create_task(self._monitor_process_output(self.process.stderr, "stderr"))
-                        
-                        self.log.info("Client connected")
+    async def start(self):
+        """Start the worker process and establish communication"""        
+        max_retries = 3
+        base_timeout = 5.0
 
+        for attempt in range(max_retries):
+            try:
+                timeout = base_timeout * (2 ** attempt)  # 5s, 10s, 20s
+
+                # Try to establish connection
+                try:
+                    if not await self._establish_connection(timeout):
+                        continue
+                    
+                    # Start monitoring process output
+                    asyncio.create_task(self._monitor_process_output(self.process.stdout, "stdout"))
+                    asyncio.create_task(self._monitor_process_output(self.process.stderr, "stderr"))
+                    
+                    self.log.info("Client connected")
                     return  # Success!
+
                 except Exception:
                     self.log.exception("Error during connection")
-                    continue  # Retry
+                    if attempt == max_retries - 1:
+                        raise
+                    continue
 
             except Exception:
                 self.log.exception(f"Attempt {attempt + 1} failed")
                 if self.process:
                     self.process.kill()
                 if attempt == max_retries - 1:
-                    raise  # Re-raise on last attempt
+                    raise
 
         raise RuntimeError(f"Failed to start worker after {max_retries} attempts")
 

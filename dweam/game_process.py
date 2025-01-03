@@ -1,9 +1,63 @@
+import os
+from pathlib import Path
+import sys
+
+
+def setup_logging() -> None:
+    """Set up logging to both console and file"""
+
+    pid = os.getpid()
+    
+    cache_dir = os.environ.get("CACHE_DIR")
+    if cache_dir is None:
+        cache_dir = Path.home() / ".dweam" / "cache"
+    else:
+        cache_dir = Path(cache_dir)
+        
+    log_dir = cache_dir / "worker_logs"
+    log_dir.mkdir(exist_ok=True)
+    
+    log_file = log_dir / f"game_process_{pid}.log"
+    
+    # Create file handle with line buffering
+    log_handle = open(log_file, 'w', buffering=1)
+    
+    # Save original stdout/stderr
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    
+    class DualOutput:
+        def __init__(self, file1, file2):
+            self.file1 = file1
+            self.file2 = file2
+        
+        def write(self, data):
+            self.file1.write(data)
+            self.file2.write(data)
+            self.file1.flush()
+            self.file2.flush()
+            
+        def flush(self):
+            self.file1.flush()
+            self.file2.flush()
+    
+    # Replace stdout/stderr with dual-output versions
+    sys.stdout = DualOutput(original_stdout, log_handle)
+    sys.stderr = DualOutput(original_stderr, log_handle)
+
+    print(f"=== Game Process {pid} Starting ===")
+    print(f"Logging to {log_file}")
+    print(f"Command line args: {sys.argv}")
+
+
+setup_logging()
+
+
 import logging
 logging.getLogger("aioice.ice").disabled = True
 
 import asyncio
 import json
-import sys
 from typing import Any
 from datetime import datetime, timedelta
 from dweam.constants import JS_TO_PYGAME_BUTTON_MAP, JS_TO_PYGAME_KEY_MAP
@@ -15,7 +69,6 @@ from av.video.frame import VideoFrame
 from aiortc import VideoStreamTrack, RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer, RTCDataChannel
 from aiortc.contrib.signaling import object_from_string, object_to_string
 import torch
-import os
 import socket
 from dweam.utils.process import patch_subprocess_popen
 
@@ -160,6 +213,8 @@ async def main():
     
     log.info("Parsed args", game_type=game_type, game_id=game_id, port=port)
     
+    log.info("Attempting to connect to parent", host='127.0.0.1', port=port)
+    
     try:
         # Connect to parent process
         reader, writer = await asyncio.open_connection(
@@ -168,7 +223,7 @@ async def main():
         )
         log.info("Connected to parent")
     except Exception as e:
-        log.error("Failed to connect to parent", error=str(e))
+        log.exception("Failed to connect to parent")
         raise
 
     # Load the game implementation
